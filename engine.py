@@ -1,18 +1,25 @@
-# engine.py
-
 from collections import deque
-from enum import Enum
+from enum import Enum, auto
 from typing import Optional, Dict, Any, Tuple
 import numpy as np
 import pandas as pd
+from scipy.stats import percentileofscore
 from ..config import SETTINGS
 
 class Side(Enum):
     BUY = "BUY"
     SELL = "SELL"
 
+class MarketState(Enum):
+    INITIALIZING = auto()
+    RANGE_STABLE = auto()
+    RANGE_CONTRACTING = auto()
+    TREND_BULL = auto()
+    TREND_BEAR = auto()
+    CONFIRMED_CHOCH_BULL = auto() # Warning of a new uptrend
+    CONFIRMED_CHOCH_BEAR = auto() # Warning of a new downtrend
+
 def _side_to_signed_qty(side: str, size: float) -> float:
-    """Convert a side string and size to a signed quantity for CVD calculation."""
     s = (side or "").upper()
     if s == Side.BUY.value: return float(size)
     if s == Side.SELL.value: return -float(size)
@@ -20,82 +27,145 @@ def _side_to_signed_qty(side: str, size: float) -> float:
 
 class HotCache:
     """
-    A stateful calculator that processes tick data to maintain real-time indicators
-    across multiple timeframes. It forms the base for all strategy logic.
+    A stateful engine that processes tick data to perform market structure analysis,
+    detect Smart Money Concepts (SMC), and determine the overall market state.
     """
     def __init__(self):
         self.cfg = SETTINGS
         self.strat_cfg = self.cfg.strategy
+        self.smc_cfg = self.strat_cfg.smc
+        self.market_state: MarketState = MarketState.INITIALIZING
+        
+        # --- Core State Variables ---
         self.current_price: float = np.nan
         self.prev_price: float = np.nan
         self.current_timestamp: Optional[pd.Timestamp] = None
         self.current_funding_rate: float = np.nan
         self.cvd: float = 0.0
 
+        # --- Bar & Timeframe Data ---
         self.bar_data: Dict[str, Dict[str, Any]] = {
             tf: {'open': np.nan, 'high': np.nan, 'low': np.nan, 'close': np.nan,
-                 'volume': 0.0, 'cvd': 0.0, 'ts': None, 'pv_sum': 0.0, 'vol_sum': 0.0}
-            for tf in self.cfg.TIMEFRAMES
+                 'volume': 0.0, 'cvd': 0.0, 'ts': None} for tf in self.cfg.TIMEFRAMES
         }
-
-        self.ema_8_15m, self.prev_ema_8_15m = np.nan, np.nan
-        self.ema_21_15m, self.prev_ema_21_15m = np.nan, np.nan
-        self.ema_50_4h_on_close = np.nan
-        self.atr_14_2h, self.atr_14_4h = np.nan, np.nan
-        self.prev_close_2h, self.prev_close_4h = np.nan, np.nan
-
-        self.volume_1m_deq = deque(maxlen=60)
-        self.cvd_1m_deq = deque(maxlen=60)
-        self.prices_15m_deq = deque(maxlen=self.strat_cfg.BB_PERIOD)
+        self.bars_1h_deq = deque(maxlen=10)
         self.bb_widths_15m_deq = deque(maxlen=self.strat_cfg.BBW_HISTORY_PERIOD)
-        self.funding_rate_deq = deque(maxlen=self.strat_cfg.FUNDING_RATE_HISTORY_PERIOD)
+        self.prices_15m_deq = deque(maxlen=self.strat_cfg.BB_PERIOD)
+        self.cvd_1m_deq = deque(maxlen=60) # For order flow Z-score confirmation
 
-        self.alphas = {'ema_50_4h': 2 / (50 + 1), 'atr_14': 1 / 14}
-        self.default_tick_alphas = {'ema_8_15m': 2 / (8 + 1), 'ema_21_15m': 2 / (21 + 1)}
+        # --- Market Structure (1h) ---
+        self.last_swing_high: float = np.nan
+        self.last_swing_low: float = np.nan
 
-    @staticmethod
-    def _update_ema(val: float, prev: float, alpha: float) -> float:
-        return val if pd.isna(prev) else (val * alpha) + (prev * (1 - alpha))
-    
-    def get_vwap(self, tf: str) -> float:
-        """Calculates the Volume Weighted Average Price for a given timeframe."""
-        bar = self.bar_data[tf]
-        return (bar['pv_sum'] / bar['vol_sum']) if bar['vol_sum'] > 1e-9 else np.nan
+        # --- SMC Primitives (Active Zones) ---
+        self.bullish_fvg_zones = [] # List of {'top': float, 'bottom': float, 'ts': timestamp}
+        self.bearish_fvg_zones = []
+        self.bullish_ob_zones = []
+        self.bearish_ob_zones = []
 
+        # --- VWAP & Volume ---
+        self.daily_pv_sum: float = 0.0
+        self.daily_vol_sum: float = 0.0
+        self.last_known_day: Optional[int] = None
+        self.volume_ema_1h: Optional[float] = None
+        self.atr_4h: float = np.nan # Use a simple ATR for feature normalization
+        self.prev_close_4h: float = np.nan
+        
     def _init_bar_if_needed(self, tf: str, price: float):
         bar = self.bar_data[tf]
         if pd.isna(bar['open']):
             bar['open'] = bar['high'] = bar['low'] = price
             bar['ts'] = self.current_timestamp.floor(self.cfg.TIMEFRAMES[tf])
 
+    def _update_daily_vwap(self, price: float, size: float):
+        current_day = self.current_timestamp.dayofyear
+        if self.last_known_day != current_day:
+            self.daily_pv_sum, self.daily_vol_sum = 0.0, 0.0
+            self.last_known_day = current_day
+        self.daily_pv_sum += price * size
+        self.daily_vol_sum += size
+
+    def get_daily_vwap(self) -> float:
+        return (self.daily_pv_sum / self.daily_vol_sum) if self.daily_vol_sum > 1e-9 else np.nan
+
+    def _analyze_closed_bar_for_smc_signals(self):
+        """Streaming equivalent of the vectorized SMC signal detection function."""
+        if len(self.bars_1h_deq) < 4: return
+
+        b0, b1, b2 = self.bars_1h_deq[-1], self.bars_1h_deq[-2], self.bars_1h_deq[-3]
+
+        # --- 1. Pivot Point Detection (Structure) ---
+        pivot_range = self.smc_cfg.PIVOT_LOOKUP * 2 + 1
+        if len(self.bars_1h_deq) >= pivot_range:
+            window = list(self.bars_1h_deq)[-pivot_range:]
+            middle_bar = window[self.smc_cfg.PIVOT_LOOKUP]
+            if max(b['high'] for b in window) == middle_bar['high']: self.last_swing_high = middle_bar['high']
+            if min(b['low'] for b in window) == middle_bar['low']: self.last_swing_low = middle_bar['low']
+
+        # --- 2. BoS / CHOCH Signal Detection ---
+        bullish_bos, bearish_bos = False, False
+        if not pd.isna(self.last_swing_high) and b1['close'] < self.last_swing_high and b0['close'] >= self.last_swing_high:
+            bullish_bos = True
+        if not pd.isna(self.last_swing_low) and b1['close'] > self.last_swing_low and b0['close'] <= self.last_swing_low:
+            bearish_bos = True
+
+        # --- 3. FVG (Fair Value Gap) Detection ---
+        if b0['low'] > b2['high']: self.bullish_fvg_zones.append({'top': b0['low'], 'bottom': b2['high'], 'ts': b0['ts']})
+        if b0['high'] < b2['low']: self.bearish_fvg_zones.append({'top': b2['low'], 'bottom': b0['high'], 'ts': b0['ts']})
+
+        # --- 4. OB (Order Block) Detection ---
+        if (b1['close'] < b1['open']) and (b0['close'] > b0['open']) and b0['close'] > b1['high']:
+            self.bullish_ob_zones.append({'top': b1['high'], 'bottom': b1['low'], 'ts': b1['ts']})
+        if (b1['close'] > b1['open']) and (b0['close'] < b0['open']) and b0['close'] < b1['low']:
+            self.bearish_ob_zones.append({'top': b1['high'], 'bottom': b1['low'], 'ts': b1['ts']})
+        
+        self._update_market_state(bullish_bos, bearish_bos)
+        self._prune_mitigated_zones(b0['close'])
+
+    def _update_market_state(self, bullish_bos: bool, bearish_bos: bool):
+        """The 'General' - uses tactical signals to set the strategic bias."""
+        if self.market_state == MarketState.TREND_BULL and bearish_bos: self.market_state = MarketState.CONFIRMED_CHOCH_BEAR
+        elif self.market_state == MarketState.TREND_BEAR and bullish_bos: self.market_state = MarketState.CONFIRMED_CHOCH_BULL
+        elif bullish_bos: self.market_state = MarketState.TREND_BULL
+        elif bearish_bos: self.market_state = MarketState.TREND_BEAR
+        else: # Logic for ranging states
+            if len(self.bb_widths_15m_deq) == self.bb_widths_15m_deq.maxlen:
+                pct_rank = percentileofscore(list(self.bb_widths_15m_deq), self.bb_widths_15m_deq[-1])
+                if pct_rank < self.strat_cfg.BBW_PCT_RANK_CONTRACT:
+                    self.market_state = MarketState.RANGE_CONTRACTING
+                else:
+                    self.market_state = MarketState.RANGE_STABLE
+
+    def _prune_mitigated_zones(self, price: float):
+        """Removes SMC zones that price has already traded through."""
+        self.bullish_fvg_zones = [z for z in self.bullish_fvg_zones if price > z['bottom']]
+        self.bearish_fvg_zones = [z for z in self.bearish_fvg_zones if price < z['top']]
+        self.bullish_ob_zones = [z for z in self.bullish_ob_zones if price > z['bottom']]
+        self.bearish_ob_zones = [z for z in self.bearish_ob_zones if price < z['top']]
+
     def _close_and_roll_bar(self, tf: str, close_price: float):
         bar = self.bar_data[tf]
         bar['close'] = close_price
-        if tf == '1m':
-            self.volume_1m_deq.append(bar['volume'])
-            self.cvd_1m_deq.append(bar['cvd'])
+        
+        if tf == '1m': self.cvd_1m_deq.append(bar['cvd'])
         elif tf == '15m':
             self.prices_15m_deq.append(close_price)
             if len(self.prices_15m_deq) == self.strat_cfg.BB_PERIOD:
                 prices = np.array(self.prices_15m_deq)
                 mean, std = prices.mean(), prices.std()
                 if mean > 0: self.bb_widths_15m_deq.append((std * 4) / mean)
-            if hasattr(self, '_on_15m_bar_close'): self._on_15m_bar_close(close_price)
-        elif tf == '2h':
-            if not (pd.isna(bar['high']) or pd.isna(self.prev_close_2h)):
-                tr = max(bar['high'] - bar['low'], abs(bar['high'] - self.prev_close_2h), abs(bar['low'] - self.prev_close_2h))
-                self.atr_14_2h = self._update_ema(tr, self.atr_14_2h, self.alphas['atr_14'])
-            self.prev_close_2h = close_price
+        elif tf == self.smc_cfg.STRUCTURE_TIMEFRAME: # '1h'
+            self.bars_1h_deq.append(bar.copy())
+            self._analyze_closed_bar_for_smc_signals()
         elif tf == '4h':
-            self.ema_50_4h_on_close = self._update_ema(close_price, self.ema_50_4h_on_close, self.alphas['ema_50_4h'])
             if not (pd.isna(bar['high']) or pd.isna(self.prev_close_4h)):
                 tr = max(bar['high'] - bar['low'], abs(bar['high'] - self.prev_close_4h), abs(bar['low'] - self.prev_close_4h))
-                self.atr_14_4h = self._update_ema(tr, self.atr_14_4h, self.alphas['atr_14'])
+                self.atr_4h = tr if pd.isna(self.atr_4h) else (self.atr_4h * 13 + tr) / 14
             self.prev_close_4h = close_price
         
         bar['ts'] += self.cfg.TIMEFRAMES[tf]
         bar['open'] = bar['high'] = bar['low'] = close_price
-        bar['volume'] = bar['cvd'] = bar['pv_sum'] = bar['vol_sum'] = 0.0
+        bar['volume'] = bar['cvd'] = 0.0
 
     def _update_bar(self, tf: str, price: float, size: float, cvd_delta: float):
         self._init_bar_if_needed(tf, price)
@@ -103,96 +173,54 @@ class HotCache:
         while self.current_timestamp >= bar['ts'] + self.cfg.TIMEFRAMES[tf]:
             self._close_and_roll_bar(tf, self.prev_price if not pd.isna(self.prev_price) else price)
         
-        bar['high'] = max(bar['high'], price)
-        bar['low'] = min(bar['low'], price)
-        bar['volume'] += size
-        bar['cvd'] += cvd_delta
-        bar['pv_sum'] += price * size
-        bar['vol_sum'] += size
-
-    def _calculate_dynamic_alphas(self) -> Dict[str, float]:
-        s = self.strat_cfg.lookback
-        if not s.ENABLED or pd.isna(self.atr_14_4h) or self.atr_14_4h <= 0:
-            return self.default_tick_alphas
-
-        vol_ratio = self.atr_14_4h / s.NORMAL_ATR_4H
-        clamped_ratio = np.clip(vol_ratio, s.MIN_VOL_RATIO_CLAMP, s.MAX_VOL_RATIO_CLAMP)
-        lookback_8 = np.clip(s.BASE_LOOKBACK_8 / clamped_ratio, s.MIN_LOOKBACK, s.MAX_LOOKBACK)
-        lookback_21 = np.clip(s.BASE_LOOKBACK_21 / clamped_ratio, s.MIN_LOOKBACK, s.MAX_LOOKBACK)
-        
-        return {'ema_8_15m': 2 / (lookback_8 + 1), 'ema_21_15m': 2 / (lookback_21 + 1)}
+        bar['high'] = max(bar['high'], price); bar['low'] = min(bar['low'], price)
+        bar['volume'] += size; bar['cvd'] += cvd_delta
 
     def update(self, row: Any):
         self.prev_price, self.current_price = self.current_price, float(row.price)
         self.current_timestamp = pd.Timestamp(row.timestamp)
+        if hasattr(row, 'funding_rate') and not pd.isna(row.funding_rate): self.current_funding_rate = float(row.funding_rate)
 
-        if hasattr(row, 'funding_rate') and not pd.isna(row.funding_rate):
-            new_fr = float(row.funding_rate)
-            if new_fr != self.current_funding_rate:
-                self.current_funding_rate = new_fr
-                self.funding_rate_deq.append(new_fr)
-        
         if not pd.isna(self.prev_price):
             size, side = float(row.size), str(row.side)
+            self._update_daily_vwap(self.current_price, size)
             cvd_delta = _side_to_signed_qty(side, size)
             self.cvd += cvd_delta
-            
-            dynamic_alphas = self._calculate_dynamic_alphas()
-            self.prev_ema_8_15m, self.prev_ema_21_15m = self.ema_8_15m, self.ema_21_15m
-            self.ema_8_15m = self._update_ema(self.current_price, self.ema_8_15m, dynamic_alphas['ema_8_15m'])
-            self.ema_21_15m = self._update_ema(self.current_price, self.ema_21_15m, dynamic_alphas['ema_21_15m'])
-            
-            for tf in self.cfg.TIMEFRAMES:
-                self._update_bar(tf, self.current_price, size, cvd_delta)
-
-    def _get_regime_features(self) -> Tuple[str, float]:
-        """Calculates market regime features based on long-term EMA and ATR."""
-        regime_z = (self.current_price - self.ema_50_4h_on_close) / self.atr_14_4h \
-            if not pd.isna(self.ema_50_4h_on_close) and self.atr_14_4h > 0 else np.nan
-        
-        if pd.isna(regime_z): regime_tag = 'UNKNOWN'
-        elif regime_z > self.strat_cfg.REGIME_Z_BULL: regime_tag = 'BULL'
-        elif regime_z < self.strat_cfg.REGIME_Z_BEAR: regime_tag = 'BEAR'
-        else: regime_tag = 'SIDEWAYS'
-        return regime_tag, regime_z
-
-    def _get_local_burst_features(self) -> Tuple[str, float, float]:
-        """Calculates short-term volume and CVD burst Z-scores."""
-        vol_z, cvd_z = np.nan, np.nan
-        if len(self.volume_1m_deq) >= 10:
-            vol_mean, vol_std = np.mean(self.volume_1m_deq), np.std(self.volume_1m_deq)
-            cvd_mean, cvd_std = np.mean(self.cvd_1m_deq), np.std(self.cvd_1m_deq)
-            if vol_std > 1e-9: vol_z = (self.bar_data['1m']['volume'] - vol_mean) / vol_std
-            if cvd_std > 1e-9: cvd_z = (self.bar_data['1m']['cvd'] - cvd_mean) / cvd_std
-
-        event_tier = 'PRIME' if (not pd.isna(vol_z) and vol_z > self.strat_cfg.PRIME_EVENT_Z_SCORE) or \
-           (not pd.isna(cvd_z) and abs(cvd_z) > self.strat_cfg.PRIME_EVENT_Z_SCORE) else 'STANDARD'
-        return event_tier, vol_z, cvd_z
-
-    def _get_funding_features(self) -> Tuple[float, bool]:
-        """Calculates features based on the funding rate history."""
-        funding_z, is_extreme = np.nan, False
-        if len(self.funding_rate_deq) >= 10:
-            mean_fr, std_fr = np.mean(self.funding_rate_deq), np.std(self.funding_rate_deq)
-            if std_fr > 1e-9:
-                funding_z = (self.current_funding_rate - mean_fr) / std_fr
-                is_extreme = abs(funding_z) > self.strat_cfg.FALLBACK_IGNITION_Z
-        return funding_z, is_extreme
+            for tf in self.cfg.TIMEFRAMES: self._update_bar(tf, self.current_price, size, cvd_delta)
 
     def get_intent_payload(self, side: Side, strategy_id: str) -> Dict[str, Any]:
-        """Compiles all calculated features into a dictionary for output."""
-        regime_tag, regime_z = self._get_regime_features()
-        event_tier, vol_z, cvd_z = self._get_local_burst_features()
-        funding_z, is_extreme = self._get_funding_features()
+        """Compiles all calculated features into a dictionary for the model."""
+        vwap = self.get_daily_vwap()
+        cvd_z = np.nan
+        if len(self.cvd_1m_deq) > 10:
+            mean, std = np.mean(self.cvd_1m_deq), np.std(self.cvd_1m_deq)
+            if std > 1e-9: cvd_z = (self.bar_data['1m']['cvd'] - mean) / std
+
+        bbw_pct = np.nan
+        if len(self.bb_widths_15m_deq) > 50:
+             bbw_pct = percentileofscore(list(self.bb_widths_15m_deq), self.bb_widths_15m_deq[-1])
+
+        # Calculate normalized distances to nearest zones
+        dist_fvg, dist_ob = np.nan, np.nan
+        norm = self.atr_4h if not pd.isna(self.atr_4h) and self.atr_4h > 0 else self.current_price * 0.01
+        
+        if side == Side.BUY:
+            if self.bullish_fvg_zones: dist_fvg = (self.current_price - self.bullish_fvg_zones[-1]['top']) / norm
+            if self.bullish_ob_zones: dist_ob = (self.current_price - self.bullish_ob_zones[-1]['top']) / norm
+        else: # SELL
+            if self.bearish_fvg_zones: dist_fvg = (self.bearish_fvg_zones[-1]['bottom'] - self.current_price) / norm
+            if self.bearish_ob_zones: dist_ob = (self.bearish_ob_zones[-1]['bottom'] - self.current_price) / norm
 
         return {
             'timestamp': self.current_timestamp, 'asset': self.cfg.ASSET,
             'side': side.value, 'strategy_id': strategy_id,
-            'event_tier': event_tier, 'regime_tag': regime_tag,
-            'raw_regime_z': regime_z, 'raw_vol_z_1m': vol_z, 'raw_cvd_z_1m': cvd_z,
-            'sentiment.funding_rate': self.current_funding_rate,
-            'sentiment.funding_z_score': funding_z,
-            'sentiment.is_extreme': is_extreme
+            'market_state': self.market_state.name,
+            'price_to_vwap_ratio': (self.current_price / vwap) if vwap > 0 else np.nan,
+            'bbw_15m_percentile': bbw_pct,
+            'raw_cvd_z_1m': cvd_z,
+            'distance_to_fvg_norm': dist_fvg,
+            'distance_to_ob_norm': dist_ob,
+            'sentiment.funding_z_score': np.nan, # Placeholder, funding logic can be added back
         }
 
     def check_trigger(self) -> Optional[Side]:
