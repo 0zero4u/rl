@@ -1,5 +1,7 @@
 # generator.py
 
+import os
+import glob
 import pandas as pd
 import numpy as np
 import pyarrow.parquet as pq
@@ -20,7 +22,12 @@ STRATEGIES = {
     "context_aware_mean_reversion": ContextAwareMeanReversion,
 }
 
-def _run_simulation_for_period(period_name: str, strategy_class: Type[HotCache], strategy_name: str):
+def _run_simulation_for_period(
+    period_name: str, 
+    strategy_class: Type[HotCache], 
+    strategy_name: str,
+    funding_df: pd.DataFrame
+):
     print(f"\n--- Starting: {period_name.upper()} | Strategy: {strategy_class.__name__} ---")
     trade_files = get_files_for_period(period_name, "processed_trades")
     if not trade_files: return
@@ -34,7 +41,14 @@ def _run_simulation_for_period(period_name: str, strategy_class: Type[HotCache],
             try:
                 for batch in pq.ParquetFile(trade_file).iter_batches(batch_size=SETTINGS.BATCH_SIZE):
                     df = batch.to_pandas()
-                    if 'funding_rate' not in df.columns: df['funding_rate'] = np.nan
+                    
+                    if not funding_df.empty:
+                        df = pd.merge_asof(
+                            df.sort_values('timestamp'), funding_df,
+                            on='timestamp', direction='backward'
+                        )
+                    else:
+                        df['funding_rate'] = np.nan
                     
                     for row in df.itertuples(index=False, name='Tick'):
                         cache.update(row)
@@ -55,14 +69,24 @@ def _run_simulation_for_period(period_name: str, strategy_class: Type[HotCache],
 
 def generate_all_features():
     """Runs simulations for all strategies and periods, then combines the results."""
+    # --- Load all funding rate data once ---
+    print("\n--- Loading all funding rate data ---")
+    funding_path = SETTINGS.get_funding_rate_path()
+    funding_files = sorted(glob.glob(os.path.join(funding_path, "*.parquet")))
+    if not funding_files:
+        print("⚠️ No funding rate files found. Proceeding without funding features.")
+        funding_df = pd.DataFrame(columns=['timestamp', 'funding_rate'])
+    else:
+        funding_df = pd.concat([pd.read_parquet(f) for f in funding_files]).sort_values('timestamp').drop_duplicates(subset=['timestamp'])
+        print(f"Loaded {len(funding_df):,} unique funding rate records.")
+
     all_payload_dfs = []
     for period in ["in_sample", "out_of_sample"]:
         for name, cls in STRATEGIES.items():
-            _run_simulation_for_period(period, cls, name)
+            _run_simulation_for_period(period, cls, name, funding_df)
             
-            # Load the generated file to combine later
             intent_path = SETTINGS.get_intents_path(period, name)
-            if pd.io.common.file_exists(intent_path):
+            if os.path.exists(intent_path):
                 df = pd.read_parquet(intent_path)
                 df['period'] = period
                 all_payload_dfs.append(df)
