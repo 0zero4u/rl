@@ -9,9 +9,10 @@ from .engine import HotCache, Side
 
 class PureMeanReversion(HotCache):
     def check_trigger(self) -> Optional[Side]:
-        if pd.isna(self.atr_14_2h) or self.bar_data['3m']['vol_sum'] < 1e-9: return None
+        vwap_3m = self.get_vwap('3m')
+        if pd.isna(self.atr_14_2h) or pd.isna(vwap_3m):
+            return None
         
-        vwap_3m = self.bar_data['3m']['pv_sum'] / self.bar_data['3m']['vol_sum']
         atr_band = self.strat_cfg.ATR_2H_TO_BAND_MULT * self.atr_14_2h
         lower, upper = vwap_3m - atr_band, vwap_3m + atr_band
         
@@ -30,10 +31,10 @@ class PureMomentumChaser(HotCache):
         return np.clip(dynamic_z, s.MIN_Z, s.MAX_Z)
 
     def check_trigger(self) -> Optional[Side]:
-        if len(self.volume_1m_deq) < 30 or self.bar_data['3m']['vol_sum'] < 1e-9: return None
+        if len(self.volume_1m_deq) < 30: return None
         
-        vwap_3m = self.bar_data['3m']['pv_sum'] / self.bar_data['3m']['vol_sum']
-        if not (self.current_price > vwap_3m or self.current_price < vwap_3m): return None
+        vwap_3m = self.get_vwap('3m')
+        if pd.isna(vwap_3m): return None
         
         vol_mean, vol_std = np.mean(self.volume_1m_deq), np.std(self.volume_1m_deq)
         cvd_mean, cvd_std = np.mean(self.cvd_1m_deq), np.std(self.cvd_1m_deq)
