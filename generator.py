@@ -1,5 +1,3 @@
-# generator.py
-
 import os
 import glob
 import pandas as pd
@@ -11,15 +9,14 @@ from ..config import SETTINGS
 from ..utils import get_files_for_period
 from .engine import HotCache
 from .strategies import (
-    PureMomentumChaser, PureMeanReversion,
-    ContextAwareMomentum, ContextAwareMeanReversion
+    SMC_Momentum_Engine,
+    SMC_Reversal_Sniper
 )
 
+# Updated dictionary to use the new SMC strategies
 STRATEGIES = {
-    "pure_momentum": PureMomentumChaser,
-    "pure_mean_reversion": PureMeanReversion,
-    "context_aware_momentum": ContextAwareMomentum,
-    "context_aware_mean_reversion": ContextAwareMeanReversion,
+    "smc_momentum": SMC_Momentum_Engine,
+    "smc_reversal": SMC_Reversal_Sniper,
 }
 
 def _run_simulation_for_period(
