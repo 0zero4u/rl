@@ -1,56 +1,41 @@
-
-
 import os
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Dict, List
 import pandas as pd
 
-# --- TRADING STRATEGY CONFIGURATION ---
+# --- NEW TRADING STRATEGY CONFIGURATION ---
 
 @dataclass(frozen=True)
-class LookbackConfig:
-    ENABLED: bool = True
-    NORMAL_ATR_4H: float = 250.0
-    BASE_LOOKBACK_8: int = 30
-    BASE_LOOKBACK_21: int = 60
-    MIN_LOOKBACK: int = 10
-    MAX_LOOKBACK: int = 120
-    MIN_VOL_RATIO_CLAMP: float = 0.5
-    MAX_VOL_RATIO_CLAMP: float = 2.0
-
-@dataclass(frozen=True)
-class IgnitionConfig:
-    ENABLED: bool = True
-    BASE_Z: float = 2.0
-    MIN_Z: float = 1.75
-    MAX_Z: float = 4.0
-    ATR_SENSITIVITY: float = 0.5
-
-@dataclass(frozen=True)
-class TrendConfig:
-    ENABLED: bool = True
-    BASE_BPS: float = 3.0
-    ATR_SENSITIVITY: float = 50.0
+class SMCConfig:
+    """Configuration for Smart Money Concepts and Market Structure Analysis."""
+    # Timeframe for market structure analysis (BoS/CHOCH)
+    STRUCTURE_TIMEFRAME: str = '1h'
+    # How many bars on each side to confirm a swing point (1 means a 3-bar pattern)
+    PIVOT_LOOKUP: int = 1
+    # High Volume Bar (HVB) Detection
+    HVB_EMA_PERIOD: int = 12
+    HVB_MULTIPLIER: float = 1.5
+    # Order Flow Confirmation
+    CVD_Z_SCORE_THRESHOLD: float = 2.5
 
 @dataclass(frozen=True)
 class TradingStrategyConfig:
-    lookback: LookbackConfig = field(default_factory=LookbackConfig)
-    ignition: IgnitionConfig = field(default_factory=IgnitionConfig)
-    trend: TrendConfig = field(default_factory=TrendConfig)
-    FALLBACK_IGNITION_Z: float = 2.5
-    FALLBACK_TREND_BPS_PER_BAR: float = 5.0
-    BBW_PCT_RANK_CONTRACT: float = 10.0
-    ATR_2H_TO_BAND_MULT: float = 1.5
+    # --- New SMC Engine Config ---
+    smc: SMCConfig = field(default_factory=SMCConfig)
+
+    # --- General Context Parameters (still useful) ---
     BB_PERIOD: int = 20
     BBW_HISTORY_PERIOD: int = 250
-    TREND_SLOPE_PERIOD: int = 5
-    FUNDING_RATE_HISTORY_PERIOD: int = 24
-    REGIME_Z_BULL: float = 1.0
-    REGIME_Z_BEAR: float = -1.0
-    PRIME_EVENT_Z_SCORE: float = 3.0
+    # Percentile rank for Bollinger Band Width to be considered contracting
+    BBW_PCT_RANK_CONTRACT: float = 10.0
 
-# --- LABELING CONFIGURATION ---
+    # --- Retained from old system for general use ---
+    FUNDING_RATE_HISTORY_PERIOD: int = 24
+    REGIME_Z_BULL: float = 1.0 # Can be repurposed or used for sentiment
+    REGIME_Z_BEAR: float = -1.0
+
+# --- LABELING CONFIGURATION (Unchanged) ---
 
 @dataclass(frozen=True)
 class LabelingConfig:
@@ -62,15 +47,20 @@ class LabelingConfig:
     STOP_LOSS_ATR: float = 2.0
     TIME_LIMIT_MINUTES: int = 60
 
-# --- MODEL TRAINING CONFIGURATION ---
+# --- MODEL TRAINING CONFIGURATION (Updated for new features) ---
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    MODEL_OUTPUT_FILE: str = "lgbm_classifier_model.joblib"
+    MODEL_OUTPUT_FILE: str = "lgbm_smc_classifier.joblib"
     FEATURE_COLUMNS: List[str] = field(default_factory=lambda: [
-        'raw_regime_z', 'raw_vol_z_1m', 'raw_cvd_z_1m',
-        'sentiment.funding_rate', 'sentiment.funding_z_score',
-        'sentiment.is_extreme', 'strategy_id'
+        'market_state',             # CATEGORICAL: The most important new feature
+        'price_to_vwap_ratio',      # CONTINUOUS: Intraday bias
+        'bbw_15m_percentile',       # CONTINUOUS: Volatility context
+        'raw_cvd_z_1m',             # CONTINUOUS: Order flow confirmation
+        'distance_to_fvg_norm',     # CONTINUOUS: Proximity to liquidity (normalized)
+        'distance_to_ob_norm',      # CONTINUOUS: Proximity to key levels (normalized)
+        'sentiment.funding_z_score',# CONTINUOUS: Retained sentiment feature
+        'strategy_id'               # CATEGORICAL: Differentiates Momentum vs. Reversal
     ])
     TARGET_COLUMN: str = 'label'
     TEST_SET_SIZE: float = 0.20
@@ -81,7 +71,7 @@ class TrainingConfig:
         'colsample_bytree': 0.8, 'subsample': 0.8,
     })
 
-# --- GLOBAL SYSTEM & DATA CONFIGURATION ---
+# --- GLOBAL SYSTEM & DATA CONFIGURATION (Largely Unchanged) ---
 
 @dataclass(frozen=True)
 class GlobalConfig:
@@ -115,7 +105,7 @@ class GlobalConfig:
     labeling: LabelingConfig = field(default_factory=LabelingConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
-    # --- Directory Methods ---
+    # --- Directory Methods (Unchanged) ---
     def _get_period_path(self, period_name: str) -> str:
         return os.path.join(self.BASE_PATH, period_name)
 
