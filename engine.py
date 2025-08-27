@@ -2,7 +2,7 @@
 
 from collections import deque
 from enum import Enum
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import numpy as np
 import pandas as pd
 from ..config import SETTINGS
@@ -56,6 +56,11 @@ class HotCache:
     @staticmethod
     def _update_ema(val: float, prev: float, alpha: float) -> float:
         return val if pd.isna(prev) else (val * alpha) + (prev * (1 - alpha))
+    
+    def get_vwap(self, tf: str) -> float:
+        """Calculates the Volume Weighted Average Price for a given timeframe."""
+        bar = self.bar_data[tf]
+        return (bar['pv_sum'] / bar['vol_sum']) if bar['vol_sum'] > 1e-9 else np.nan
 
     def _init_bar_if_needed(self, tf: str, price: float):
         bar = self.bar_data[tf]
@@ -140,31 +145,45 @@ class HotCache:
             for tf in self.cfg.TIMEFRAMES:
                 self._update_bar(tf, self.current_price, size, cvd_delta)
 
-    def get_intent_payload(self, side: Side, strategy_id: str) -> Dict[str, Any]:
+    def _get_regime_features(self) -> Tuple[str, float]:
+        """Calculates market regime features based on long-term EMA and ATR."""
         regime_z = (self.current_price - self.ema_50_4h_on_close) / self.atr_14_4h \
             if not pd.isna(self.ema_50_4h_on_close) and self.atr_14_4h > 0 else np.nan
-
-        vol_z = cvd_z = np.nan
-        if len(self.volume_1m_deq) >= 10:
-            vol_mean, vol_std = np.mean(self.volume_1m_deq), np.std(self.volume_1m_deq)
-            cvd_mean, cvd_std = np.mean(self.cvd_1m_deq), np.std(self.cvd_1m_deq)
-            if vol_std > 1e-9: vol_z = (self.bar_data['1m']['volume'] - vol_mean) / vol_std
-            if cvd_std > 1e-9: cvd_z = (self.bar_data['1m']['cvd'] - cvd_mean) / cvd_std
         
         if pd.isna(regime_z): regime_tag = 'UNKNOWN'
         elif regime_z > self.strat_cfg.REGIME_Z_BULL: regime_tag = 'BULL'
         elif regime_z < self.strat_cfg.REGIME_Z_BEAR: regime_tag = 'BEAR'
         else: regime_tag = 'SIDEWAYS'
+        return regime_tag, regime_z
+
+    def _get_local_burst_features(self) -> Tuple[str, float, float]:
+        """Calculates short-term volume and CVD burst Z-scores."""
+        vol_z, cvd_z = np.nan, np.nan
+        if len(self.volume_1m_deq) >= 10:
+            vol_mean, vol_std = np.mean(self.volume_1m_deq), np.std(self.volume_1m_deq)
+            cvd_mean, cvd_std = np.mean(self.cvd_1m_deq), np.std(self.cvd_1m_deq)
+            if vol_std > 1e-9: vol_z = (self.bar_data['1m']['volume'] - vol_mean) / vol_std
+            if cvd_std > 1e-9: cvd_z = (self.bar_data['1m']['cvd'] - cvd_mean) / cvd_std
 
         event_tier = 'PRIME' if (not pd.isna(vol_z) and vol_z > self.strat_cfg.PRIME_EVENT_Z_SCORE) or \
            (not pd.isna(cvd_z) and abs(cvd_z) > self.strat_cfg.PRIME_EVENT_Z_SCORE) else 'STANDARD'
+        return event_tier, vol_z, cvd_z
 
+    def _get_funding_features(self) -> Tuple[float, bool]:
+        """Calculates features based on the funding rate history."""
         funding_z, is_extreme = np.nan, False
         if len(self.funding_rate_deq) >= 10:
             mean_fr, std_fr = np.mean(self.funding_rate_deq), np.std(self.funding_rate_deq)
             if std_fr > 1e-9:
                 funding_z = (self.current_funding_rate - mean_fr) / std_fr
                 is_extreme = abs(funding_z) > self.strat_cfg.FALLBACK_IGNITION_Z
+        return funding_z, is_extreme
+
+    def get_intent_payload(self, side: Side, strategy_id: str) -> Dict[str, Any]:
+        """Compiles all calculated features into a dictionary for output."""
+        regime_tag, regime_z = self._get_regime_features()
+        event_tier, vol_z, cvd_z = self._get_local_burst_features()
+        funding_z, is_extreme = self._get_funding_features()
 
         return {
             'timestamp': self.current_timestamp, 'asset': self.cfg.ASSET,
