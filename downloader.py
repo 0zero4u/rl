@@ -43,14 +43,14 @@ def download_and_process_funding_rate():
                     csv_filename = z.namelist()[0]
                     with z.open(csv_filename) as f:
                         df = pd.read_csv(f)
-                        if 'fundingTime' in df.columns: timestamp_col = 'fundingTime'
-                        elif 'calc_time' in df.columns: timestamp_col = 'calc_time'
-                        else: raise KeyError("Timestamp column not found.")
+                        
+                        def _find_col(df: pd.DataFrame, possible_names: list) -> str:
+                            for name in possible_names:
+                                if name in df.columns: return name
+                            raise KeyError(f"None of the possible columns found: {possible_names}")
 
-                        if 'fundingRate' in df.columns: funding_rate_col = 'fundingRate'
-                        elif 'last_funding_rate' in df.columns: funding_rate_col = 'last_funding_rate'
-                        elif 'funding_rate' in df.columns: funding_rate_col = 'funding_rate'
-                        else: raise KeyError("Funding rate column not found.")
+                        timestamp_col = _find_col(df, ['fundingTime', 'calc_time'])
+                        funding_rate_col = _find_col(df, ['fundingRate', 'last_funding_rate', 'funding_rate'])
 
                         df['timestamp'] = pd.to_datetime(df[timestamp_col], unit='ms', utc=True)
                         df.rename(columns={funding_rate_col: 'funding_rate'}, inplace=True)
